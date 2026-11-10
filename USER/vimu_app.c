@@ -49,6 +49,7 @@ static volatile uint8_t g_vimuI2cRxCount         = 0U;
 static volatile uint8_t g_i2cFifoSample[VIMU_UART_SAMPLE_SIZE]; /* staged sample */
 static volatile uint8_t g_i2cFifoByteIdx    = 0U;  /* byte offset within staged sample */
 static volatile uint8_t g_i2cFifoReadActive = 0U;  /* 1 while serving FIFO data */
+static volatile uint8_t g_i2cFifoPopPending = 0U;  /* staged sample still in the FIFO */
 
 /* ── Forward declarations ───────────────────────────────────────────── */
 static uint8_t  vimu_fifo_transfer_one_from_ring(void);
@@ -705,8 +706,37 @@ void vimu_app_i2c_write_register(uint8_t reg, uint8_t value)
 /* ── I2C slave callbacks (called from ISR) ──────────────────────────── */
 
 /*
+ * Stage the oldest FIFO sample for the next 6 bytes WITHOUT removing it.
+ * The STM32F1 slave transmitter loads DR one byte ahead of the bus, so the
+ * byte staged last in every burst read is never sent. Popping here lost one
+ * real sample per burst, and the ESP32 then read past the FIFO end and got
+ * register bytes (0,4112,0) or zeros. I2C_Slave_OnTxByte() pops the sample
+ * once its byte 2 is requested, i.e. once byte 0 was really sent and ACKed.
+ */
+static uint8_t vimu_i2c_stage_fifo_sample(void)
+{
+    vimu_sample_t sample;
+
+    if (vimu_fifo_peek(&g_vimuApp.fifo, &sample) == 0U)
+    {
+        return 0U;
+    }
+
+    /* Convert LE int16 → MMA8451 big-endian per axis */
+    g_i2cFifoSample[0] = sample.bytes[1]; /* X_MSB */
+    g_i2cFifoSample[1] = sample.bytes[0]; /* X_LSB */
+    g_i2cFifoSample[2] = sample.bytes[3]; /* Y_MSB */
+    g_i2cFifoSample[3] = sample.bytes[2]; /* Y_LSB */
+    g_i2cFifoSample[4] = sample.bytes[5]; /* Z_MSB */
+    g_i2cFifoSample[5] = sample.bytes[4]; /* Z_LSB */
+    g_i2cFifoByteIdx    = 0U;
+    g_i2cFifoPopPending = 1U;
+    return 1U;
+}
+
+/*
  * Called when the master addresses this slave.
- * isTransmitter=1: master wants to read  → pre-load first FIFO sample.
+ * isTransmitter=1: master wants to read  → stage first FIFO sample.
  * isTransmitter=0: master wants to write → reset Rx counter.
  */
 void I2C_Slave_OnAddressed(uint8_t isTransmitter)
@@ -714,27 +744,16 @@ void I2C_Slave_OnAddressed(uint8_t isTransmitter)
     g_vimuI2cRxCount      = 0U;
     g_i2cFifoReadActive   = 0U;
     g_i2cFifoByteIdx      = 0U;
+    g_i2cFifoPopPending   = 0U;
 
     if (isTransmitter != 0U)
     {
         g_vimuI2cCurrentRegister = g_vimuI2cRegisterPointer;
 
-        /* Pre-load first FIFO sample when reading OUT_X_MSB */
+        /* Stage first FIFO sample when reading OUT_X_MSB */
         if (g_vimuI2cCurrentRegister == MMA8451_REG_OUT_X_MSB)
         {
-            vimu_sample_t sample;
-            if (vimu_fifo_pop(&g_vimuApp.fifo, &sample) != 0U)
-            {
-                /* Convert LE int16 → MMA8451 big-endian per axis */
-                g_i2cFifoSample[0] = sample.bytes[1]; /* X_MSB */
-                g_i2cFifoSample[1] = sample.bytes[0]; /* X_LSB */
-                g_i2cFifoSample[2] = sample.bytes[3]; /* Y_MSB */
-                g_i2cFifoSample[3] = sample.bytes[2]; /* Y_LSB */
-                g_i2cFifoSample[4] = sample.bytes[5]; /* Z_MSB */
-                g_i2cFifoSample[5] = sample.bytes[4]; /* Z_LSB */
-                g_i2cFifoByteIdx   = 0U;
-                g_i2cFifoReadActive = 1U;
-            }
+            g_i2cFifoReadActive = vimu_i2c_stage_fifo_sample();
         }
     }
 }
@@ -763,7 +782,7 @@ void I2C_Slave_OnRxByte(uint8_t data)
  * Called for each byte the master reads.
  *
  * If a FIFO read is active (register pointer was OUT_X_MSB) we serve bytes
- * from the staging buffer and pre-load the next sample every 6 bytes,
+ * from the staging buffer and stage the next sample every 6 bytes,
  * enabling efficient burst reads of multiple samples in one transaction.
  * All other registers go through the normal register-map handler.
  */
@@ -776,26 +795,21 @@ uint8_t I2C_Slave_OnTxByte(void)
     {
         if (g_i2cFifoByteIdx >= VIMU_UART_SAMPLE_SIZE)
         {
-            /* One sample fully transmitted – pre-load next if available */
-            vimu_sample_t next;
-            if (vimu_fifo_pop(&g_vimuApp.fifo, &next) != 0U)
-            {
-                g_i2cFifoSample[0] = next.bytes[1];
-                g_i2cFifoSample[1] = next.bytes[0];
-                g_i2cFifoSample[2] = next.bytes[3];
-                g_i2cFifoSample[3] = next.bytes[2];
-                g_i2cFifoSample[4] = next.bytes[5];
-                g_i2cFifoSample[5] = next.bytes[4];
-                g_i2cFifoByteIdx = 0U;
-            }
-            else
-            {
-                g_i2cFifoReadActive = 0U;
-            }
+            /* One sample fully transmitted – stage next if available */
+            g_i2cFifoReadActive = vimu_i2c_stage_fifo_sample();
         }
 
         if (g_i2cFifoReadActive != 0U)
         {
+            if ((g_i2cFifoPopPending != 0U) && (g_i2cFifoByteIdx >= 2U))
+            {
+                /* Byte 2 requested: byte 0 was sent and ACKed, so the master
+                 * really reads this sample - take it off the FIFO now. */
+                vimu_sample_t sent;
+                (void)vimu_fifo_pop(&g_vimuApp.fifo, &sent);
+                g_i2cFifoPopPending = 0U;
+            }
+
             data = (uint8_t)g_i2cFifoSample[g_i2cFifoByteIdx];
             g_i2cFifoByteIdx++;
         }
@@ -812,12 +826,14 @@ uint8_t I2C_Slave_OnTxByte(void)
     return data;
 }
 
-/* Called on STOP condition – update IRQ to reflect current FIFO depth. */
+/* Called on STOP condition – update IRQ to reflect current FIFO depth.
+ * A staged sample that was never sent stays in the FIFO. */
 void I2C_Slave_OnStop(void)
 {
     g_vimuI2cRxCount      = 0U;
     g_i2cFifoReadActive   = 0U;
     g_i2cFifoByteIdx      = 0U;
+    g_i2cFifoPopPending   = 0U;
     vimu_app_update_fifo_irq();
 }
 
@@ -832,5 +848,6 @@ void I2C_Slave_OnError(void)
     g_vimuI2cCurrentRegister = MMA8451_REG_F_STATUS;
     g_i2cFifoReadActive      = 0U;
     g_i2cFifoByteIdx         = 0U;
+    g_i2cFifoPopPending      = 0U;
     vimu_app_update_fifo_irq();
 }
